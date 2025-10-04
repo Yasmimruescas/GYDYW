@@ -1,0 +1,685 @@
+// AntiRansomMonitorWithHoneypots/Program.cs
+using System;
+using System.IO;
+using System.Text.Json;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+using System.Security.Cryptography;
+
+class Program
+{
+    // ============================
+    // CONFIGURAÇÕES GERAIS
+    // ============================
+    static string MANIFEST_PATH = Path.Combine(@"C:\Temp", "honeypot_manifest.json");
+    static string LOG_PATH = Path.Combine(@"C:\Temp", "security_log.txt");
+    static string DUMP_DIR = Path.Combine(@"C:\Temp", "dumps");
+    static string MONITOR_PATH = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+    // Onde honeypots serão criados
+    static string[] HONEYPOT_DIRS = new string[]
+    {
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory),
+        Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments),
+        Path.Combine(Path.GetTempPath(), "honeypots")
+    };
+
+    static string[] HONEYPOT_FILES = new string[]
+    {
+        "senhas.txt",
+        "contas_de_banco.xlsx",
+        "imposto_de_renda.pdf",
+        "contrato.docx",
+        "fotos_familia_1.jpg",
+        "documentos_importantes.docx"
+    };
+
+    // Extensões críticas
+    static string[] CRITICAL_EXTENSIONS = { ".doc", ".docx", ".xls", ".xlsx", ".pptx", ".pdf", ".zip", ".7z", ".exe", ".dll", ".bat", ".ps1", ".vbs" };
+
+    // Whitelist
+    static HashSet<string> WHITELIST_PATHS = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32\\notepad.exe")
+    };
+    static HashSet<string> WHITELIST_NAMES = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "svchost.exe", "lsass.exe", "services.exe", "lsm.exe"
+    };
+
+    // Limiares
+    static int ALERT_THRESHOLD = 20;
+    static int ALERT_WINDOW = 10;
+
+    static string[] PATH_EXCLUSIONS = new[]
+    {
+        Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "AppData"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86))
+    };
+
+    const int WATCHER_INTERNAL_BUFFER_BYTES = 128 * 1024;
+    const int HONEYPOT_CHECK_INTERVAL_MS = 5000;
+
+    // Variáveis de controle
+    static List<DateTime> fileActivity = new List<DateTime>();
+    static HashSet<string> trackedNewDrives = new HashSet<string>();
+    static HashSet<string> knownDrives = new HashSet<string>();
+    static volatile bool keepRunning = true;
+    static readonly object activityLock = new object();
+    static volatile bool handlingIncident = false;
+
+    // ============================
+    // P/ evitar reentrância do watcher (opcional)
+    static readonly object watcherLock = new object();
+    // ============================
+
+    // ============================
+    // WinAPI / Debug helpers
+    // ============================
+    [DllImport("ntdll.dll", SetLastError = true)]
+    static extern uint NtSuspendProcess(IntPtr processHandle);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    static extern uint NtResumeProcess(IntPtr processHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("Dbghelp.dll", SetLastError = true)]
+    static extern bool MiniDumpWriteDump(IntPtr hProcess, uint ProcessId, SafeFileHandle hFile, uint DumpType, IntPtr ExceptionParam, IntPtr UserStreamParam, IntPtr CallbackParam);
+
+    const uint PROCESS_ALL_ACCESS = 0x001F0FFF;
+    const uint MiniDumpWithFullMemory = 0x00000002;
+
+    // ============================
+    // MAIN
+    // ============================
+    static void Main()
+    {
+        Directory.CreateDirectory(DUMP_DIR);
+        LOG("AntiRansomMonitor + Honeypots: iniciando...");
+
+        // 1) Cria honeypots antes de ativar monitor
+        CreateHoneypots();
+
+        // 2) Inicia monitor de honeypots
+        var honeypotThread = new Thread(MonitorHoneypotsLoop) { IsBackground = true };
+        honeypotThread.Start();
+
+        // 3) Inicia watcher loop
+        var watcherThread = new Thread(() => StartWatcherLoop()) { IsBackground = true };
+        watcherThread.Start();
+
+        knownDrives = GetMountedDrives();
+
+        Console.CancelKeyPress += (s, e) =>
+        {
+            LOG("Recebido CTRL+C, encerrando...");
+            keepRunning = false;
+            e.Cancel = true;
+        };
+
+        try
+        {
+            while (keepRunning)
+            {
+                var current = GetMountedDrives();
+                var added = current.Except(knownDrives).ToList();
+                var removed = knownDrives.Except(current).ToList();
+                knownDrives = current;
+
+                foreach (var d in added)
+                {
+                    LOG($"Nova unidade detectada: {d}");
+                    trackedNewDrives.Add(d);
+                }
+                foreach (var d in removed)
+                {
+                    LOG($"Unidade removida: {d}");
+                    trackedNewDrives.Remove(d);
+                }
+
+                MonitorProcessesOnDrives(trackedNewDrives);
+                Thread.Sleep(3000);
+            }
+        }
+        catch (Exception ex)
+        {
+            LOG("Erro no loop principal: " + ex.Message);
+        }
+
+        LOG("Finalizado.");
+    }
+
+    // ============================
+    // FUNÇÃO DE CRIAÇÃO DE HONEYPOTS
+    // ============================
+    static void CreateHoneypots()
+    {
+        LOG("Criando honeypots...");
+        var manifest = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var dir in HONEYPOT_DIRS)
+        {
+            if (string.IsNullOrWhiteSpace(dir)) continue;
+            try { Directory.CreateDirectory(dir); }
+            catch (Exception ex) { LOG($"Não foi possível criar/usar '{dir}': {ex.Message}"); continue; }
+
+            foreach (var fname in HONEYPOT_FILES)
+            {
+                var path = Path.Combine(dir, fname);
+                var content = $"CONFIDENCIAL\nCriado em: {DateTime.Now}\nProprietário: Sistema de Honeypots\n\n";
+
+                try
+                {
+                    File.WriteAllText(path, content);
+                    File.SetAttributes(path, FileAttributes.Normal);
+                    manifest[Path.GetFullPath(path)] = ComputeSha256(path);
+                    LOG($"Honeypot criado: {path}");
+                }
+                catch (Exception ex)
+                {
+                    LOG($"Erro ao criar honeypot {path}: {ex.Message}");
+                }
+            }
+        }
+
+        try
+        {
+            var root = new Dictionary<string, object>
+            {
+                ["created"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                ["files"] = manifest
+            };
+            var opts = new JsonSerializerOptions { WriteIndented = true };
+            File.WriteAllText(MANIFEST_PATH, JsonSerializer.Serialize(root, opts));
+            LOG("Manifest salvo em: " + MANIFEST_PATH);
+        }
+        catch (Exception ex)
+        {
+            LOG("Erro ao salvar manifest: " + ex.Message);
+        }
+    }
+
+    // ============================
+    // WATCHER LOOP (restarts on error)
+    // ============================
+    static void StartWatcherLoop()
+    {
+        while (keepRunning)
+        {
+            try
+            {
+                using var watcher = new FileSystemWatcher(MONITOR_PATH)
+                {
+                    IncludeSubdirectories = true,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size,
+                    InternalBufferSize = WATCHER_INTERNAL_BUFFER_BYTES
+                };
+
+                watcher.Created += (s, e) => SafeHandleFileEvent(e.FullPath);
+                watcher.Changed += (s, e) => SafeHandleFileEvent(e.FullPath);
+                watcher.Renamed += (s, e) => SafeHandleFileEvent(e.FullPath);
+                watcher.Deleted += (s, e) => SafeHandleFileEvent(e.FullPath);
+                watcher.Error += (s, e) =>
+                {
+                    LOG("FileSystemWatcher erro (provável overflow) — reiniciando watcher...");
+                    // loop will exit using/disposing and restart
+                };
+
+                watcher.EnableRaisingEvents = true;
+                LOG("Watcher ativo em: " + MONITOR_PATH);
+
+                while (keepRunning)
+                {
+                    Thread.Sleep(1000);
+                }
+            }
+            catch (Exception ex)
+            {
+                LOG("Falha no Watcher: " + ex.Message + " — tentando reiniciar em 5s");
+                Thread.Sleep(5000);
+            }
+        }
+    }
+
+    // ============================
+    // Safe wrapper para eventos de arquivo
+    // ============================
+    static void SafeHandleFileEvent(string fullPath)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(fullPath)) return;
+
+            var normalized = Path.GetFullPath(fullPath);
+
+            foreach (var ex in PATH_EXCLUSIONS)
+            {
+                if (!string.IsNullOrEmpty(ex) && normalized.StartsWith(ex, StringComparison.OrdinalIgnoreCase))
+                    return;
+            }
+
+            var ext = Path.GetExtension(normalized);
+            if (string.IsNullOrEmpty(ext))
+            {
+                // ainda pode ser honeypot com nome sem extensão
+                if (!IsPathAHoneypot(normalized)) return;
+            }
+            else
+            {
+                if (!CRITICAL_EXTENSIONS.Contains(ext, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (!IsPathAHoneypot(normalized)) return;
+                }
+            }
+
+            var honeypots = LoadManifest().Keys.Select(p => Path.GetFullPath(p)).ToList();
+            OnFileEvent(normalized, honeypots);
+        }
+        catch (Exception ex)
+        {
+            LOG("Erro ao tratar SafeHandleFileEvent: " + ex.Message);
+        }
+    }
+
+    // ============================
+    // Evento de arquivo
+    // ============================
+    static void OnFileEvent(string path, List<string> honeypots)
+    {
+        try
+        {
+            var full = Path.GetFullPath(path);
+
+            if (honeypots.Any(h => string.Equals(h, full, StringComparison.OrdinalIgnoreCase)))
+            {
+                LOG($"[ATAQUE] Honeypot foi modificado: {full}");
+                HandleIncident(full, "honeypot-modified");
+                return;
+            }
+
+            var ext = Path.GetExtension(full);
+            if (CRITICAL_EXTENSIONS.Any(e => string.Equals(e, ext, StringComparison.OrdinalIgnoreCase)))
+            {
+                LOG($"Arquivo crítico criado/alterado: {full}");
+                RegisterActivity();
+            }
+        }
+        catch (Exception ex)
+        {
+            LOG($"Erro ao tratar evento de arquivo '{path}': {ex.Message}");
+        }
+    }
+
+    // ============================
+    // Registra atividade para detecção por janela temporal
+    // ============================
+    static void RegisterActivity()
+    {
+        var now = DateTime.Now;
+        lock (activityLock)
+        {
+            fileActivity.Add(now);
+            fileActivity = fileActivity.Where(t => (now - t).TotalSeconds < ALERT_WINDOW).ToList();
+
+            if (fileActivity.Count >= ALERT_THRESHOLD)
+            {
+                LOG("Muitas alterações rápidas detectadas (possível ransomware).");
+                HandleIncident(null, "high-file-activity");
+            }
+        }
+    }
+
+    // ============================
+    // Gerenciamento de incidentes
+    // ============================
+    static void HandleIncident(string? evidencePath, string reason)
+    {
+        if (handlingIncident) { LOG("Incidente já em tratamento, ignorando duplicata."); return; }
+        handlingIncident = true;
+
+        try
+        {
+            LOG($"Iniciando procedimento de resposta (reason={reason})");
+
+            // 1) Reunir candidatos (processos não whitelist)
+            var suspects = new List<Process>();
+            foreach (var proc in Process.GetProcesses())
+            {
+                try
+                {
+                    string? exe = null;
+                    try { exe = proc.MainModule?.FileName; }
+                    catch { /* falta de permissão -> ignorar */ }
+
+                    if (string.IsNullOrEmpty(exe))
+                    {
+                        if (WHITELIST_NAMES.Contains(proc.ProcessName + ".exe")) continue;
+                    }
+                    if (!IsWhitelisted(exe))
+                    {
+                        suspects.Add(proc);
+                    }
+                }
+                catch { /* ignorar processo inacessível */ }
+            }
+
+            LOG($"Candidatos suspeitos: {suspects.Count}");
+
+            // 2) Para cada candidato: suspender, gerar minidump, coletar info, e então finalizar
+            foreach (var p in suspects)
+            {
+                try
+                {
+                    LOG($"Suspender e coletar: PID {p.Id} ({SafeProcName(p)})");
+                    bool suspended = TrySuspendProcess(p);
+                    if (suspended)
+                    {
+                        var dumpFile = Path.Combine(DUMP_DIR, $"proc_{p.Id}_{DateTime.Now:yyyyMMdd_HHmmss}.dmp");
+                        if (TryCreateMiniDump(p, dumpFile))
+                        {
+                            LOG($"Dump criado: {dumpFile}");
+                        }
+                        else
+                        {
+                            LOG($"Falha ao criar dump PID {p.Id}");
+                        }
+                    }
+                    else
+                    {
+                        LOG($"Falha ao suspender PID {p.Id} — tentarei kill direto");
+                    }
+
+                    LOG($"[AÇÃO] Finalizando processo PID {p.Id}");
+                    try
+                    {
+                        p.Kill();
+                        LOG($"PID {p.Id} finalizado.");
+                    }
+                    catch (Exception exKill)
+                    {
+                        LOG($"Falha ao finalizar PID {p.Id}: {exKill.Message}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LOG($"Erro ao tratar suspeito PID {p.Id}: {ex.Message}");
+                }
+                finally
+                {
+                    try { TryResumeProcessById(p.Id); } catch { }
+                }
+            }
+
+            // 3) Salvar manifiesto e evidências
+            try
+            {
+                if (!string.IsNullOrEmpty(evidencePath))
+                {
+                    var copyDest = Path.Combine(DUMP_DIR, "honeypot_evidence_" + Path.GetFileName(evidencePath));
+                    try { File.Copy(evidencePath, copyDest, true); LOG("Cópia de honeypot salva em: " + copyDest); }
+                    catch (Exception ex) { LOG("Falha ao salvar cópia do honeypot: " + ex.Message); }
+                }
+
+                try
+                {
+                    if (File.Exists(MANIFEST_PATH))
+                    {
+                        var mf = Path.Combine(DUMP_DIR, "manifest_snapshot_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json");
+                        File.Copy(MANIFEST_PATH, mf);
+                        LOG("Manifest snapshot salvo: " + mf);
+                    }
+                }
+                catch (Exception ex) { LOG("Falha ao salvar manifest snapshot: " + ex.Message); }
+            }
+            catch { }
+
+            // Aqui você pode disparar snapshot, isolar NIC, notificar SIEM etc.
+        }
+        catch (Exception ex)
+        {
+            LOG("Erro no HandleIncident: " + ex.Message);
+        }
+        finally
+        {
+            handlingIncident = false;
+            lock (activityLock) fileActivity.Clear();
+        }
+    }
+
+    // ============================
+    // Monitor processos iniciados a partir de drives externos
+    // ============================
+    static void MonitorProcessesOnDrives(HashSet<string> drives)
+    {
+        if (drives == null || drives.Count == 0) return;
+
+        foreach (var proc in Process.GetProcesses())
+        {
+            try
+            {
+                string? exe = null;
+                try { exe = proc.MainModule?.FileName; }
+                catch { continue; }
+
+                if (string.IsNullOrEmpty(exe) || IsWhitelisted(exe)) continue;
+
+                foreach (var d in drives)
+                {
+                    var root = d.TrimEnd('\\') + "\\";
+                    if (exe.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                    {
+                        LOG($"Processo suspeito iniciado de unidade {d}: {exe} (PID {proc.Id})");
+                        HandleIncident(null, "process-from-extern-drive");
+                        break;
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    // ============================
+    // Whitelist check
+    // ============================
+    static bool IsWhitelisted(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        try
+        {
+            if (WHITELIST_PATHS.Contains(path)) return true;
+            var name = Path.GetFileName(path);
+            if (WHITELIST_NAMES.Contains(name)) return true;
+        }
+        catch { }
+        return false;
+    }
+
+    // ============================
+    // Monitor honeypots (periodic)
+    // ============================
+    static void MonitorHoneypotsLoop()
+    {
+        while (keepRunning)
+        {
+            try
+            {
+                var manifest = LoadManifest();
+                foreach (var kv in manifest)
+                {
+                    var file = kv.Key;
+                    var expectedHash = kv.Value;
+                    try
+                    {
+                        if (!File.Exists(file))
+                        {
+                            LOG($"Honeypot ausente: {file}");
+                            HandleIncident(file, "honeypot-missing");
+                            continue;
+                        }
+                        var actual = ComputeSha256(file);
+                        if (!string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase))
+                        {
+                            LOG($"Honeypot alterado (hash mismatch): {file}");
+                            HandleIncident(file, "honeypot-hash-mismatch");
+                        }
+                    }
+                    catch (Exception ex) { LOG($"Erro ao verificar honeypot {file}: {ex.Message}"); }
+                }
+            }
+            catch (Exception ex)
+            {
+                LOG("Erro em MonitorHoneypotsLoop: " + ex.Message);
+            }
+            Thread.Sleep(HONEYPOT_CHECK_INTERVAL_MS);
+        }
+    }
+
+    // ============================
+    // Load manifest (assume formato { "files": { "C:\\path": "sha256", ... } })
+    // ============================
+    static Dictionary<string, string> LoadManifest()
+    {
+        try
+        {
+            if (!File.Exists(MANIFEST_PATH)) return new Dictionary<string, string>();
+            var json = File.ReadAllText(MANIFEST_PATH);
+            var root = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json);
+            if (root != null && root.TryGetValue("files", out var filesElement))
+            {
+                var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var prop in filesElement.EnumerateObject())
+                {
+                    dict[Path.GetFullPath(prop.Name)] = prop.Value.GetString() ?? "";
+                }
+                return dict;
+            }
+        }
+        catch (Exception ex)
+        {
+            LOG($"Erro ao carregar manifest: {ex.Message}");
+        }
+        return new Dictionary<string, string>();
+    }
+
+    static bool IsPathAHoneypot(string path)
+    {
+        try
+        {
+            var m = LoadManifest();
+            return m.Keys.Any(k => string.Equals(Path.GetFullPath(k), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase));
+        }
+        catch { return false; }
+    }
+
+    // ============================
+    // List mounted drives
+    // ============================
+    static HashSet<string> GetMountedDrives()
+    {
+        try
+        {
+            return DriveInfo.GetDrives()
+                .Where(d => d.IsReady)
+                .Select(d => d.RootDirectory.FullName.ToUpperInvariant())
+                .ToHashSet();
+        }
+        catch (Exception ex)
+        {
+            LOG($"Erro ao listar drives: {ex.Message}");
+            return new HashSet<string>();
+        }
+    }
+
+    // ============================
+    // Compute SHA256
+    // ============================
+    static string ComputeSha256(string path)
+    {
+        using var fs = File.OpenRead(path);
+        using var sha = SHA256.Create();
+        var hash = sha.ComputeHash(fs);
+        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+    }
+
+    // ============================
+    // Suspend/Resume/Dump helpers
+    // ============================
+    static bool TrySuspendProcess(Process p)
+    {
+        try
+        {
+            var h = OpenProcess(PROCESS_ALL_ACCESS, false, p.Id);
+            if (h == IntPtr.Zero) return false;
+            var r = NtSuspendProcess(h);
+            CloseHandle(h);
+            return r == 0;
+        }
+        catch { return false; }
+    }
+
+    static bool TryResumeProcessById(int pid)
+    {
+        try
+        {
+            var h = OpenProcess(PROCESS_ALL_ACCESS, false, pid);
+            if (h == IntPtr.Zero) return false;
+            var r = NtResumeProcess(h);
+            CloseHandle(h);
+            return r == 0;
+        }
+        catch { return false; }
+    }
+
+    static bool TryCreateMiniDump(Process p, string outFile)
+    {
+        try
+        {
+            var hProc = OpenProcess(PROCESS_ALL_ACCESS, false, p.Id);
+            if (hProc == IntPtr.Zero) return false;
+            using var fs = new FileStream(outFile, FileMode.Create, FileAccess.Write, FileShare.None);
+            var safe = fs.SafeFileHandle;
+            bool ok = MiniDumpWriteDump(hProc, (uint)p.Id, safe, MiniDumpWithFullMemory, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            CloseHandle(hProc);
+            return ok;
+        }
+        catch { return false; }
+    }
+
+    static string SafeProcName(Process p)
+    {
+        try { return p.MainModule?.FileName ?? p.ProcessName; }
+        catch { return p.ProcessName; }
+    }
+
+    // ============================
+    // LOG helper
+    // ============================
+    static void LOG(string msg)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(LOG_PATH);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
+            var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {msg}";
+            File.AppendAllText(LOG_PATH, line + Environment.NewLine);
+            Console.WriteLine(line);
+        }
+        catch
+        {
+            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] (log falhou) {msg}");
+        }
+    }
+}
